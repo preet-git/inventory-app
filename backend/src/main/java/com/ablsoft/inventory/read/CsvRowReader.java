@@ -41,14 +41,12 @@ public final class CsvRowReader implements RowReader {
     private static final int BYTE_ORDER_MARK = 0xFEFF;
 
     private final Reader reader;
-    private final int maxDataRows;
 
-    CsvRowReader(InputStream inputStream, int maxDataRows) {
+    CsvRowReader(InputStream inputStream) {
         CharsetDecoder strictUtf8 = StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT);
         this.reader = new InputStreamReader(inputStream, strictUtf8);
-        this.maxDataRows = maxDataRows;
     }
 
     @Override
@@ -56,7 +54,6 @@ public final class CsvRowReader implements RowReader {
         ColumnLayout layout = null;
         List<String> closestCandidate = List.of();
         int scanned = 0;
-        int dataRows = 0;
 
         try (CSVParser parser = FORMAT.parse(reader)) {
             for (CSVRecord record : parser) {
@@ -81,12 +78,8 @@ public final class CsvRowReader implements RowReader {
                     continue;
                 }
 
-                if (++dataRows > maxDataRows) {
-                    throw ImportException.invalidFile(
-                            "File contains more than " + maxDataRows + " data rows.");
-                }
                 // Record numbers count from 1 and include the header, so they are the row numbers
-                // the user sees. Safe to narrow: the row cap bounds this long before int does.
+                // the user sees.
                 consumer.accept(layout.toRawRow((int) record.getRecordNumber(), cells));
             }
         } catch (RuntimeException e) {

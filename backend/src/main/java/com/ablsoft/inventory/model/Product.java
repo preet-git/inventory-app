@@ -22,6 +22,11 @@ public record Product(
      * "03/16/2024".
      */
     public String uniqueKey() {
+        return uniqueKey(productSku, purchaseDate);
+    }
+
+    /** The same key for a row that is already stored, so both sides agree on what collides. */
+    public static String uniqueKey(String productSku, LocalDate purchaseDate) {
         return productSku + "|" + purchaseDate;
     }
 

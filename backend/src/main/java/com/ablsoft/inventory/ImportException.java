@@ -35,6 +35,16 @@ public class ImportException extends RuntimeException {
         return new ImportException(HttpStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_file_type", message, null);
     }
 
+    /** The import queue is full. Retrying later is the right response, so say so with 429. */
+    public static ImportException busy(String message) {
+        return new ImportException(HttpStatus.TOO_MANY_REQUESTS, "import_queue_full", message, null);
+    }
+
+    /** No import with that id. */
+    public static ImportException notFound(String message) {
+        return new ImportException(HttpStatus.NOT_FOUND, "not_found", message, null);
+    }
+
     public HttpStatus status() {
         return status;
     }

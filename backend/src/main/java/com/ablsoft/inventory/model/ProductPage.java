@@ -4,15 +4,21 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
 
-/** One page of the dashboard table. */
+/**
+ * One page of the dashboard table.
+ *
+ * <p>Cursor-paged rather than numbered: {@code nextCursor} is fed back as the {@code cursor}
+ * parameter to fetch the next page. There is no total count here on purpose — counting the table
+ * on every page request is the cost this style of paging exists to avoid. The summary endpoint
+ * carries the total.
+ */
 public record ProductPage(
         List<Row> content,
-        int page,
         int size,
-        int totalElements,
-        int totalPages,
         String sortBy,
-        String direction) {
+        String direction,
+        String nextCursor,
+        boolean hasMore) {
 
     /** A table row, including the two columns the dashboard derives rather than stores. */
     public record Row(
@@ -25,18 +31,5 @@ public record ProductPage(
             int quantity,
             BigDecimal lineValue,
             long stockAgeDays) {
-
-        public static Row from(Product product, LocalDate asOf) {
-            return new Row(
-                    product.rowNumber(),
-                    product.productSku(),
-                    product.productName(),
-                    product.category(),
-                    product.purchaseDate(),
-                    product.unitPrice(),
-                    product.quantity(),
-                    product.lineValue(),
-                    product.stockAgeDays(asOf));
-        }
     }
 }

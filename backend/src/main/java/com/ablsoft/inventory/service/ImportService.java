@@ -1,145 +1,245 @@
 package com.ablsoft.inventory.service;
 
 import com.ablsoft.inventory.ImportException;
+import com.ablsoft.inventory.entity.ImportRunEntity;
+import com.ablsoft.inventory.entity.ImportStatus;
 import com.ablsoft.inventory.model.ImportResult;
 import com.ablsoft.inventory.model.Product;
 import com.ablsoft.inventory.model.RawRow;
+import com.ablsoft.inventory.model.RejectedRow;
 import com.ablsoft.inventory.read.FileType;
 import com.ablsoft.inventory.read.RowReader;
+import com.ablsoft.inventory.repository.ImportRejectionRepository;
+import com.ablsoft.inventory.repository.ImportRunRepository;
 import com.ablsoft.inventory.validate.RowValidator;
 import java.io.IOException;
 import java.io.InputStream;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.RejectedExecutionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.core.task.TaskExecutor;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 /**
- * Imports one file: read it, validate every row, drop duplicates, replace what the dashboard
- * shows.
+ * Accepts a file and imports it in the background.
  *
- * <p>Rows are processed in file order on the calling thread. That ordering is what makes duplicate
- * handling deterministic — the first row to claim a SKU + date keeps it — and it is fast enough
- * that parallelism would buy nothing: the work is dominated by parsing the file, not by the rules.
+ * <p>The upload call does only what must happen before a client can be given an answer: stage the
+ * bytes, check the file really is a spreadsheet, and record the run. Everything expensive happens
+ * on a worker, because a file of millions of rows takes minutes and no HTTP client waits that long
+ * — the request would be cut by a proxy or the browser long before the work finished.
+ *
+ * <p>Rows are read, validated and written in chunks, so a file's size decides how long an import
+ * runs rather than how much memory it needs.
  */
 @Service
 public class ImportService {
 
     private static final Logger log = LoggerFactory.getLogger(ImportService.class);
 
-    /** Enforced while reading, so an enormous file is refused before it is fully parsed. */
-    private static final int MAX_DATA_ROWS = 50_000;
+    /**
+     * Rows per transaction. Large enough that per-statement overhead disappears into the batch,
+     * small enough that a chunk's worth of objects is nothing next to the heap.
+     */
+    private static final int CHUNK_SIZE = 1_000;
 
-    private final ProductStore store;
+    /** Rejected row numbers returned inline; the rest are paged from the rejections endpoint. */
+    private static final int INLINE_REJECTION_LIMIT = 100;
+
+    private final ImportRunRepository runs;
+    private final ImportRejectionRepository rejections;
+    private final ImportChunkWriter writer;
+    private final TaskExecutor executor;
     private final RowValidator validator = new RowValidator();
 
-    public ImportService(ProductStore store) {
-        this.store = store;
+    public ImportService(ImportRunRepository runs,
+                         ImportRejectionRepository rejections,
+                         ImportChunkWriter writer,
+                         @Qualifier("importExecutor") TaskExecutor executor) {
+        this.runs = runs;
+        this.rejections = rejections;
+        this.writer = writer;
+        this.executor = executor;
     }
 
-    public ImportResult importFile(MultipartFile file) throws IOException {
+    /**
+     * Where an import has got to, with the first page of rejected row numbers attached.
+     *
+     * <p>Only the first {@value #INLINE_REJECTION_LIMIT} are inlined: a large file can reject a
+     * great many rows, and nobody wants them all in a status response. The rest are paged.
+     */
+    public ImportResult status(long importId) {
+        ImportRunEntity run = runs.findById(importId)
+                .orElseThrow(() -> ImportException.notFound("No import with id " + importId));
+        List<Integer> rowNumbers = rejectedRowNumbers(importId, 0, INLINE_REJECTION_LIMIT);
+        return ImportResult.of(run, rowNumbers, run.getRowsRejected() > rowNumbers.size());
+    }
+
+    public List<Integer> rejectedRowNumbers(long importId, int page, int size) {
+        return rejections
+                .findByImportIdOrderByRowNumberAsc(importId,
+                        PageRequest.of(Math.max(page, 0), Math.clamp(size, 1, 1_000)))
+                .stream()
+                .map(rejection -> rejection.getRowNumber())
+                .toList();
+    }
+
+    /**
+     * Validates the upload enough to accept it, then queues it.
+     *
+     * <p>Deliberately not transactional: the run row must be committed before the worker starts,
+     * or the worker could look for a row that no other connection can see yet.
+     *
+     * @return the run as it stands right now, still PENDING and with no counts
+     */
+    public ImportResult submit(MultipartFile file) throws IOException {
         if (file.isEmpty()) {
             throw ImportException.invalidFile("Uploaded file is empty.");
         }
 
         Path staged = stage(file);
+        ImportRunEntity run;
+        FileType type;
         try {
-            FileType type = FileType.detect(file.getOriginalFilename(), staged);
-            return read(staged, type, file.getOriginalFilename());
+            // Fail here rather than on a worker: a client that sent the wrong kind of file should
+            // be told so in the response to the upload, not by polling a job that failed.
+            type = FileType.detect(file.getOriginalFilename(), staged);
+            run = runs.save(new ImportRunEntity(file.getOriginalFilename(), LocalDate.now()));
+        } catch (RuntimeException | IOException e) {
+            deleteQuietly(staged);
+            throw e;
+        }
+
+        long importId = run.getId();
+        LocalDate referenceDate = run.getReferenceDate();
+        try {
+            executor.execute(() -> runImport(importId, staged, type, referenceDate));
+        } catch (RejectedExecutionException e) {
+            deleteQuietly(staged);
+            throw ImportException.busy(
+                    "Too many imports are already running. Try again when one has finished.");
+        }
+        return ImportResult.of(run, List.of(), false);
+    }
+
+    /** Running totals for one file. Confined to the worker thread, so plain collections are fine. */
+    private static final class Tally {
+        final List<Product> pending = new ArrayList<>(CHUNK_SIZE);
+        final List<RejectedRow> rejections = new ArrayList<>();
+        /**
+         * Keys already claimed by this file, so the first row to use a SKU and date keeps it.
+         * This is the one structure that grows with the file — tens of MB per million distinct
+         * rows. Beyond that, deduplication belongs in the database rather than in the worker.
+         */
+        final Set<String> seenKeys = new HashSet<>();
+        int rowsRead;
+        int rowsImported;
+        int rowsRejected;
+    }
+
+    private void runImport(long importId, Path staged, FileType type, LocalDate referenceDate) {
+        log.info("Import {} starting: {}", importId, staged.getFileName());
+        Tally tally = new Tally();
+        try {
+            writer.markRunning(importId);
+
+            try (RowReader reader = RowReader.open(staged, type)) {
+                reader.forEachRow(row -> accept(row, tally, importId));
+            }
+            flush(tally, importId);
+
+            writer.markCompleted(importId, tally.rowsRead, tally.rowsImported, tally.rowsRejected);
+            log.info("Import {} finished: {} rows read, {} imported, {} rejected",
+                    importId, tally.rowsRead, tally.rowsImported, tally.rowsRejected);
+
+        } catch (Throwable e) {
+            // Throwable, not Exception: an Error here (a missing class, OOM on a huge sheet) would
+            // otherwise kill the worker silently and strand the run in RUNNING forever, with no way
+            // for a client polling /api/imports/{id} to learn that it died.
+            log.warn("Import {} failed after {} rows", importId, tally.rowsRead, e);
+            writer.markFailed(importId, describe(e));
         } finally {
             deleteQuietly(staged);
         }
     }
 
-    /** Running totals for one file. Single-threaded, so plain collections need no locking. */
-    private static final class Tally {
-        final Map<String, Product> accepted = new LinkedHashMap<>();
-        final List<Integer> rejectedRowNumbers = new ArrayList<>();
-        int rowsRead;
+    /** Errors often carry no message; the class name is all a client would otherwise get. */
+    private static String describe(Throwable e) {
+        String message = e.getMessage();
+        return message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
     }
 
-    private ImportResult read(Path staged, FileType type, String fileName) throws IOException {
-        // One "today" for the whole file, so a midnight rollover cannot age row 50,000 a day
-        // differently from row 2.
-        LocalDate importedOn = LocalDate.now();
-        Tally tally = new Tally();
-
-        try (RowReader reader = RowReader.open(staged, type, MAX_DATA_ROWS)) {
-            reader.forEachRow(row -> accept(row, tally));
-        }
-
-        List<Product> products = List.copyOf(tally.accepted.values());
-        ImportResult result = new ImportResult(
-                new ImportResult.Summary(
-                        fileName,
-                        tally.rowsRead,
-                        products.size(),
-                        tally.rejectedRowNumbers.size(),
-                        totalValue(products),
-                        averageStockAge(products, importedOn)),
-                new ImportResult.Rejected(
-                        tally.rejectedRowNumbers.size(), List.copyOf(tally.rejectedRowNumbers)));
-
-        store.replace(products, result, importedOn);
-        log.info("Imported {}: {} rows read, {} imported, {} rejected",
-                fileName, tally.rowsRead, products.size(), tally.rejectedRowNumbers.size());
-        return result;
-    }
-
-    private void accept(RawRow row, Tally tally) {
+    private void accept(RawRow row, Tally tally, long importId) {
         tally.rowsRead++;
 
         RowValidator.Result result = validator.validate(row);
         if (!result.accepted()) {
-            tally.rejectedRowNumbers.add(row.rowNumber());
-            // The API reports row numbers only; the reasons are one log level away.
-            log.debug("Row {} rejected: {}", row.rowNumber(), String.join("; ", result.reasons()));
+            reject(tally, row.rowNumber(), String.join("; ", result.reasons()));
+        } else {
+            Product product = result.product();
+            if (tally.seenKeys.add(product.uniqueKey())) {
+                tally.pending.add(product);
+                tally.rowsImported++;
+            } else {
+                // Two rows in one file claiming the same SKU and date. The first won; this one is
+                // reported. Removing it here also keeps a single upsert statement from touching the
+                // same row twice, which Postgres refuses.
+                reject(tally, product.rowNumber(), "Duplicate Product SKU and Purchase Date in this file");
+            }
+        }
+
+        if (tally.pending.size() >= CHUNK_SIZE) {
+            flush(tally, importId);
+        }
+    }
+
+    private static void reject(Tally tally, int rowNumber, String reason) {
+        tally.rejections.add(new RejectedRow(rowNumber, reason));
+        tally.rowsRejected++;
+        log.debug("Row {} rejected: {}", rowNumber, reason);
+    }
+
+    private void flush(Tally tally, long importId) {
+        if (tally.pending.isEmpty() && tally.rejections.isEmpty()) {
             return;
         }
-
-        Product product = result.product();
-        Product existing = tally.accepted.putIfAbsent(product.uniqueKey(), product);
-        if (existing != null) {
-            tally.rejectedRowNumbers.add(product.rowNumber());
-            log.debug("Row {} rejected: duplicate of row {} ({} on {})",
-                    product.rowNumber(), existing.rowNumber(), product.productSku(), product.purchaseDate());
-        }
-    }
-
-    private static BigDecimal totalValue(List<Product> products) {
-        return products.stream()
-                .map(Product::lineValue)
-                .reduce(BigDecimal.ZERO, BigDecimal::add)
-                .setScale(2, RoundingMode.HALF_UP);
-    }
-
-    private static BigDecimal averageStockAge(List<Product> products, LocalDate asOf) {
-        if (products.isEmpty()) {
-            return BigDecimal.ZERO.setScale(2);
-        }
-        double average = products.stream()
-                .mapToLong(product -> product.stockAgeDays(asOf))
-                .average()
-                .orElse(0);
-        return BigDecimal.valueOf(average).setScale(2, RoundingMode.HALF_UP);
+        writer.writeChunk(importId, tally.pending, tally.rejections,
+                tally.rowsRead, tally.rowsImported, tally.rowsRejected);
+        tally.pending.clear();
+        tally.rejections.clear();
     }
 
     /**
-     * Copies the upload to a temp file, because POI needs a {@code File} and because the
-     * magic-number check and the parser both have to read the bytes. With
-     * {@code file-size-threshold: 0B} Tomcat has already spooled the part to disk, so this is a
-     * disk-to-disk copy rather than a trip through the heap. Only the extension is taken from the
-     * client's filename — a name from a request never builds a path.
+     * A run left at RUNNING can only be the remains of a process that died mid-import, since a
+     * live one is on this JVM's executor. Marking it FAILED stops it polling forever.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void failInterruptedImports() {
+        List<ImportRunEntity> stale = runs.findByStatusIn(List.of(ImportStatus.PENDING, ImportStatus.RUNNING));
+        for (ImportRunEntity run : stale) {
+            writer.markFailed(run.getId(), "Interrupted by a restart; some rows may already be imported.");
+            log.warn("Import {} was left {} by a previous run; marked FAILED", run.getId(), run.getStatus());
+        }
+    }
+
+    /**
+     * Copies the upload to a temp file. POI needs a {@code File}, the magic-number check and the
+     * parser both have to read the bytes, and the worker needs them after the request has returned.
+     * With {@code file-size-threshold: 0B} Tomcat has already spooled the part to disk, so this is
+     * a disk-to-disk copy. Only the extension is taken from the client's filename — a name from a
+     * request never builds a path.
      */
     private static Path stage(MultipartFile file) throws IOException {
         Path staged = Files.createTempFile("ablsoft-import-", suffixOf(file.getOriginalFilename()));

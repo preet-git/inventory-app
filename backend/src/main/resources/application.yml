@@ -2,27 +2,45 @@ spring:
   application:
     name: inventory-import
 
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:inventory}
+    username: ${DB_USER:inventory}
+    password: ${DB_PASSWORD:inventory}
+    hikari:
+      maximum-pool-size: 10
+      # An import holds a connection per chunk, not for its whole run, but a large file still
+      # keeps the pool busy for minutes. Leak detection would only produce false positives.
+      leak-detection-threshold: 0
+
+  jpa:
+    hibernate:
+      # Flyway owns the schema; Hibernate only checks that it matches the entities.
+      ddl-auto: validate
+    # Off by default in Boot, but stated explicitly: a view must never hold a DB connection.
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 1000
+
+  flyway:
+    locations: classpath:db/migration
+
   threads:
     virtual:
-      # An import holds its request for the whole file, so serving requests on virtual threads
-      # keeps a long upload from occupying one of a small pool of platform threads.
       enabled: true
 
   servlet:
     multipart:
-      # Spring parses MB as binary, so 15MB is exactly 15 MiB. The container rejects an oversized
-      # upload before any of our code runs.
-      max-file-size: 15MB
-      max-request-size: 16MB
-      # 0B streams every uploaded part straight to a temp file instead of buffering it in the heap,
-      # which matters because POI needs headroom to evaluate formulas.
+      # Large enough for a multi-million-row export. The upload is streamed to a temp file, so
+      # this bounds disk rather than heap.
+      max-file-size: 512MB
+      max-request-size: 513MB
       file-size-threshold: 0B
 
 server:
   port: 8080
   tomcat:
-    # When Tomcat rejects an oversized upload it must still drain the rest of the body, or the
-    # client sees a connection reset instead of our 400.
     max-swallow-size: 20MB
 
 logging:

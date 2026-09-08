@@ -18,9 +18,13 @@ public interface RowReader extends Closeable {
 
     void forEachRow(Consumer<RawRow> consumer) throws IOException;
 
-    static RowReader open(Path path, FileType type, int maxDataRows) throws IOException {
+    /**
+     * There is no row limit. Both readers stream, so a file's size bounds how long an import
+     * takes rather than how much memory it needs.
+     */
+    static RowReader open(Path path, FileType type) throws IOException {
         return type.isExcel()
-                ? new ExcelRowReader(path, maxDataRows)
-                : new CsvRowReader(Files.newInputStream(path), maxDataRows);
+                ? new ExcelRowReader(path, type)
+                : new CsvRowReader(Files.newInputStream(path));
     }
 }
