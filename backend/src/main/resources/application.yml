@@ -4,8 +4,8 @@ spring:
 
   datasource:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:inventory}
-    username: postgres
-    password: tushar07
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
     hikari:
       maximum-pool-size: 10
       # An import holds a connection per chunk, not for its whole run, but a large file still
