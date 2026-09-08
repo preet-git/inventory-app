@@ -13,7 +13,7 @@ services:
 
   backend:
     build:
-      context: ./backend
+      context: .          # was ./backend — now it's the same folder
     image: inventory-backend:db
     container_name: inventory-backend
     depends_on:
