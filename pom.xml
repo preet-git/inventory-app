@@ -12,7 +12,7 @@
 	</parent>
 
 	<groupId>com.ablsoft</groupId>
-	<artifactId>inventory-import</artifactId>
+	<artifactId>inventory</artifactId>
 	<version>1.0.0</version>
 	<name>inventory-import</name>
 	<description>ABLSoft technical test: product inventory import (CSV / Excel) into PostgreSQL</description>
@@ -31,10 +31,6 @@
 			<artifactId>spring-boot-starter-webmvc</artifactId>
 		</dependency>
 		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-validation</artifactId>
-		</dependency>
-		<dependency>
 			<groupId>org.apache.poi</groupId>
 			<artifactId>poi</artifactId>
 			<version>${poi.version}</version>
@@ -48,11 +44,6 @@
 			<groupId>org.apache.commons</groupId>
 			<artifactId>commons-csv</artifactId>
 			<version>${commons-csv.version}</version>
-		</dependency>
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-configuration-processor</artifactId>
-			<optional>true</optional>
 		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
@@ -86,11 +77,6 @@
 			<artifactId>poi-shared-strings</artifactId>
 			<version>${poi-shared-strings.version}</version>
 			<scope>runtime</scope>
-		</dependency>
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-webmvc-test</artifactId>
-			<scope>test</scope>
 		</dependency>
 	</dependencies>
 

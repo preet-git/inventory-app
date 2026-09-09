@@ -3,6 +3,7 @@ package com.ablsoft.inventory.web;
 import com.ablsoft.inventory.ImportException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -31,6 +32,22 @@ public class ApiExceptionHandler {
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<ApiError> handleBadParameter(IllegalArgumentException e) {
         return ResponseEntity.badRequest().body(new ApiError("invalid_request", e.getMessage()));
+    }
+
+    /**
+     * The same failure, after Spring has repackaged it.
+     *
+     * <p>{@code ProductRepositoryCustomImpl} is a {@code @Repository}, so Spring translates what it
+     * throws into its own data-access hierarchy -- which turns the {@link IllegalArgumentException}
+     * a bad {@code sortBy} raises into this, past the handler above. Unwrapped here so the caller
+     * still gets a 400 naming the valid columns instead of a blank 500.
+     */
+    @ExceptionHandler(InvalidDataAccessApiUsageException.class)
+    public ResponseEntity<ApiError> handleTranslatedBadParameter(InvalidDataAccessApiUsageException e) {
+        if (e.getCause() instanceof IllegalArgumentException cause) {
+            return handleBadParameter(cause);
+        }
+        return handleUnexpected(e);
     }
 
     /** Tomcat rejected the body before our own size check could run. */
